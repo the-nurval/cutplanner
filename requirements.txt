@@ -1,0 +1,6 @@
+numpy
+scipy
+openpyxl
+matplotlib
+pandas
+streamlit>=1.50
