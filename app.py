@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Web interface for cutplanner. Run:  python -m streamlit run app.py"""
 import re, tempfile, hmac, os
+from datetime import datetime, timedelta, timezone
+from streamlit_cookies_controller import CookieController
+from auth_session import COOKIE_NAME, SESSION_HOURS, issue_token, valid_token
 from argparse import Namespace
 from pathlib import Path
 
@@ -31,29 +34,49 @@ def _credential(name):
 def require_login():
     username = _credential('username')
     password = _credential('password')
-    if not username or not password:
-        st.error('Login is not configured. Set [auth] username and password in Streamlit secrets.')
+    cookie_secret = _credential('cookie_secret')
+    if not username or not password or not cookie_secret:
+        st.error('Login configuration missing: set [auth] username, password and cookie_secret in Streamlit Secrets.')
         st.stop()
 
+    cookies = CookieController(key='cutplanner_cookie_control')
+    # Streamlit session_state resets on browser refresh. Restore it from a signed,
+    # expiring cookie instead of saving the password in browser storage.
     if not st.session_state.get('authenticated', False):
-        st.title('✂️ Cutplanner')
-        st.write('Sign in to access the cutting planner.')
-        with st.form('login_form'):
-            input_user = st.text_input('Username', autocomplete='username')
-            input_password = st.text_input('Password', type='password', autocomplete='current-password')
-            submitted = st.form_submit_button('Sign in', type='primary')
-        if submitted:
-            user_ok = hmac.compare_digest(input_user.encode('utf-8'), username.encode('utf-8'))
-            pass_ok = hmac.compare_digest(input_password.encode('utf-8'), password.encode('utf-8'))
-            if user_ok and pass_ok:
-                st.session_state['authenticated'] = True
-                st.rerun()
-            else:
-                st.error('Invalid username or password.')
+        token = cookies.get(COOKIE_NAME)
+        if token and valid_token(token, username, password, cookie_secret):
+            st.session_state['authenticated'] = True
+
+    if not st.session_state.get('authenticated', False):
+        st.markdown("""<style>
+          [data-testid="stSidebar"] {display:none;}
+          .block-container {padding-top: clamp(3rem, 12vh, 7rem);}
+        </style>""", unsafe_allow_html=True)
+        left, center, right = st.columns([1, 1.05, 1], gap='large')
+        with center:
+            st.markdown('### ✂️ Cutplanner')
+            st.caption('Sign in to access the cutting planner')
+            with st.form('login_form'):
+                input_user = st.text_input('Username', autocomplete='username')
+                input_password = st.text_input('Password', type='password', autocomplete='current-password')
+                submitted = st.form_submit_button('Sign in', type='primary', use_container_width=True)
+            if submitted:
+                user_ok = hmac.compare_digest(input_user.encode(), username.encode())
+                pass_ok = hmac.compare_digest(input_password.encode(), password.encode())
+                if user_ok and pass_ok:
+                    token = issue_token(username, password, cookie_secret)
+                    cookies.set(COOKIE_NAME, token,
+                                expires=datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS),
+                                secure=True, same_site='strict')
+                    st.session_state['authenticated'] = True
+                    st.rerun()
+                else:
+                    st.error('Invalid username or password.')
         st.stop()
 
     with st.sidebar:
         if st.button('Log out', key='logout_button'):
+            cookies.remove(COOKIE_NAME)
             st.session_state.clear()
             st.rerun()
 

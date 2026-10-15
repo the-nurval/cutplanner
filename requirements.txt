@@ -4,3 +4,4 @@ openpyxl
 matplotlib
 pandas
 streamlit>=1.50
+streamlit-cookies-controller>=0.0.4

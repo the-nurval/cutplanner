@@ -78,6 +78,7 @@ Alternatively set environment variables `CUTPLANNER_USERNAME` and `CUTPLANNER_PA
 [auth]
 username = "your-team-login"
 password = "your-unique-strong-password"
+cookie_secret = "another-long-random-secret-for-cookie-signing"
 ```
 
 Never upload real credentials to GitHub or share them in chat. Without credentials the
@@ -86,7 +87,7 @@ app refuses access. Users can log out with the sidebar **Log out** button.
 **Limitations:** This is a shared password gate, not per-user Supabase Auth; it has no
 per-user audit trail, roles, or account recovery. Use a long random password and share
 it only with trusted staff. Network-level brute-force protections and more advanced
-access controls are not included. Session is tied to the user's Streamlit connection.
+access controls are not included. A signed browser cookie keeps the shared login active for up to 12 hours (including browser refresh and 30+ minutes idle). The cookie does not contain credentials. Cookies are created through a community Streamlit component and are not HttpOnly; for stronger security use provider-based authentication later. Logout clears the browser cookie. Closing/reopening the browser before expiry usually preserves access. Changing the shared password or cookie_secret invalidates previous cookies.
 
 **Database note:** This release adds authentication ONLY. It continues to store the
 pattern library in the local SQLite `patterns.db`. For persistent cloud storage, migrate
