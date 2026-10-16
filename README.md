@@ -92,3 +92,17 @@ access controls are not included. A signed browser cookie keeps the shared login
 **Database note:** This release adds authentication ONLY. It continues to store the
 pattern library in the local SQLite `patterns.db`. For persistent cloud storage, migrate
 that library to Supabase PostgreSQL before relying on it for production data.
+
+
+### Login session persistence (updated)
+The auth cookie is now restored from `st.context.cookies` on a fresh browser request.
+After sign-in and sign-out, a short delay gives the browser cookie component time to write/remove the cookie before a Streamlit rerun.
+This is designed for HTTPS Streamlit Cloud; use the same browser and domain when checking persistence.
+If persistence is blocked by browser cookie/privacy settings, check the browser's cookie storage.
+
+
+## Session persistence (URL token version)
+
+After sign-in, the app stores a signed, time-limited token in the URL query parameter `session`. Reloading the page and reopening that same URL within 12 hours keeps the user signed in, even on Streamlit Cloud. There is no dependency on JS cookies. A fresh visit to the bare app URL requires sign-in.
+
+**Security trade-off:** Anyone who obtains the complete logged-in URL can use it until its token expires. Do not share it, paste it into tickets, or put it in screenshots. Logging out removes the token from the current URL but cannot revoke a copied token. Rotating `cookie_secret` in Secrets revokes all active tokens. Browser history may retain URLs. For a production-grade solution, switch to server-side sessions and Supabase Auth or an OIDC provider.

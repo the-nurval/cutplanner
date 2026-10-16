@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """Web interface for cutplanner. Run:  python -m streamlit run app.py"""
 import re, tempfile, hmac, os
-from datetime import datetime, timedelta, timezone
-from streamlit_cookies_controller import CookieController
 from auth_session import COOKIE_NAME, SESSION_HOURS, issue_token, valid_token
 from argparse import Namespace
 from pathlib import Path
@@ -39,15 +37,15 @@ def require_login():
         st.error('Login configuration missing: set [auth] username, password and cookie_secret in Streamlit Secrets.')
         st.stop()
 
-    cookies = CookieController(key='cutplanner_cookie_control')
-    # Streamlit session_state resets on browser refresh. Restore it from a signed,
-    # expiring cookie instead of saving the password in browser storage.
-    if not st.session_state.get('authenticated', False):
-        token = cookies.get(COOKIE_NAME)
-        if token and valid_token(token, username, password, cookie_secret):
-            st.session_state['authenticated'] = True
-
-    if not st.session_state.get('authenticated', False):
+    # Signed bearer token in the URL survives full browser reloads without
+    # relying on JS cookie components or Streamlit WebSocket cookie forwarding.
+    # IMPORTANT: users must not share a logged-in URL.
+    token = st.query_params.get('session', '')
+    authenticated = bool(token and valid_token(token, username, password, cookie_secret))
+    if not authenticated:
+        if token:
+            # Expired/invalid token: prevent confusing repeated failures.
+            del st.query_params['session']
         st.markdown("""<style>
           [data-testid="stSidebar"] {display:none;}
           .block-container {padding-top: clamp(3rem, 12vh, 7rem);}
@@ -64,11 +62,7 @@ def require_login():
                 user_ok = hmac.compare_digest(input_user.encode(), username.encode())
                 pass_ok = hmac.compare_digest(input_password.encode(), password.encode())
                 if user_ok and pass_ok:
-                    token = issue_token(username, password, cookie_secret)
-                    cookies.set(COOKIE_NAME, token,
-                                expires=datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS),
-                                secure=True, same_site='strict')
-                    st.session_state['authenticated'] = True
+                    st.query_params['session'] = issue_token(username, password, cookie_secret)
                     st.rerun()
                 else:
                     st.error('Invalid username or password.')
@@ -76,7 +70,7 @@ def require_login():
 
     with st.sidebar:
         if st.button('Log out', key='logout_button'):
-            cookies.remove(COOKIE_NAME)
+            del st.query_params['session']
             st.session_state.clear()
             st.rerun()
 
