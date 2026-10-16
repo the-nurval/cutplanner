@@ -4,3 +4,5 @@ openpyxl
 matplotlib
 pandas
 streamlit>=1.50
+
+psycopg[binary]>=3.2,<4

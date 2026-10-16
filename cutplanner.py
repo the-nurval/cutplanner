@@ -13,6 +13,7 @@ then strips -> columns -> pieces. Patterns that are found are saved in SQLite an
 reused in later calculations.
 """
 import argparse, csv, json, math, re, sqlite3, sys, time
+from storage import connect as connect_database
 from pathlib import Path
 import numpy as np
 from scipy.optimize import linprog, milp, LinearConstraint, Bounds
@@ -97,12 +98,13 @@ def parse_orders(path, unit='in'): return orders_from_rows(read_order_rows(path)
 # ---------------------------------------------------------------- pattern library
 class Library:
     def __init__(self, path):
-        self.db = sqlite3.connect(path)
+        self.db = connect_database(path)
         self.db.execute('''CREATE TABLE IF NOT EXISTS patterns(
             key TEXT PRIMARY KEY, sw INT, sl INT, data TEXT, area_used REAL,
             times_used INT DEFAULT 0, created TEXT)''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS jobs(
             id INTEGER PRIMARY KEY, name TEXT, created TEXT, result TEXT)''')
+        self.db.commit()
     def load(self, sw, sl, pieces):
         out = {}
         for key, data in self.db.execute('SELECT key,data FROM patterns WHERE sw=? AND sl=?', (sw, sl)):
