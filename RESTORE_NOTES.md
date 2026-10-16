@@ -1,0 +1,1 @@
+Base interface: cutplanner_refresh_stable.zip (unchanged original cutting visualization). Cloud persistence: Supabase backend retained. Cloud reports and browser vault confined to collapsed section in Library tab. No modifications to the Python optimization or drawing functions.

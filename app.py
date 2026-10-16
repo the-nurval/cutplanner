@@ -80,8 +80,6 @@ def require_login():
 
 require_login()
 st.title('✂️ Paper cutting layout for the guillotine')
-if not cloud_enabled():
-    st.info('Cloud database not configured yet. Local SQLite is active; on Streamlit Cloud this data may be lost after restart. Set [database] url in Secrets for Supabase.')
 
 ss = st.session_state
 ss.setdefault('df', pd.DataFrame({COL_W: pd.Series(dtype=float), COL_L: pd.Series(dtype=float), COL_QTY: pd.Series(dtype=float)}))
@@ -162,48 +160,20 @@ with tab_calc:
                     cp.write_xlsx(Path(td) / 'r.xlsx', R['pl'], R['result'], orders, pack, R['byproducts'])
                     R['pdf'] = (Path(td) / 'r.pdf').read_bytes(); R['xlsx'] = (Path(td) / 'r.xlsx').read_bytes()
             R['pack'] = pack; R['unit_label'] = unit_label; ss.R = R
-            # Unique identifier makes cloud writes safe to retry without duplicates.
+            # Persistence only: leave the original UI and drawings untouched.
             created = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            snapshot = dict(id=str(uuid.uuid4()), name='Cutting layout ' + created[:16].replace('T', ' '),
-                            created=created, sheets=R['total_sheets'], patterns=len(R['result']),
-                            waste=round(R['waste'], 2),
-                            pdf=base64.b64encode(R['pdf']).decode('ascii'),
-                            xlsx=base64.b64encode(R['xlsx']).decode('ascii'))
-            ss.snapshot = snapshot
+            ss.snapshot = dict(id=str(uuid.uuid4()), name='Cutting layout ' + created[:16].replace('T',' '),
+                created=created, sheets=R['total_sheets'], patterns=len(R['result']),
+                waste=round(R['waste'],2), pdf=base64.b64encode(R['pdf']).decode('ascii'),
+                xlsx=base64.b64encode(R['xlsx']).decode('ascii'))
             try:
-                save_result(DB, snapshot)
+                save_result(DB, ss.snapshot)
                 ss.sync_error = None
             except Exception as exc:
                 ss.sync_error = str(exc)
 
         except cp.PlanError as e:
             ss.R = None; st.error(str(e))
-
-    if ss.get('sync_error'):
-        st.warning('Result generated, but cloud persistence failed. A browser-local copy is available below when browser storage is enabled. Database error: ' + ss.sync_error)
-        if st.button('Retry cloud save') and ss.get('snapshot'):
-            try:
-                save_result(DB, ss.snapshot)
-                ss.sync_error = None
-                st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
-    # A separate browser component stores finished reports in IndexedDB.
-    # Unlike Streamlit session_state, these are retained across page refreshes.
-    vault = components.declare_component('cutplanner_browser_vault', path=str(Path(__file__).with_name('browser_vault')))
-    vault_event = vault(result=ss.snapshot, synced=not bool(ss.sync_error),
-                        ack=ss.get('sync_ack'), key='cutplanner_browser_archive', default=None)
-    if isinstance(vault_event, dict) and vault_event.get('pending'):
-        candidate = vault_event['pending']
-        if isinstance(candidate, dict) and candidate.get('id') != ss.get('sync_ack'):
-            try:
-                save_result(DB, candidate)
-                ss.sync_ack = candidate['id']
-                ss.sync_error = None
-                st.rerun()
-            except Exception as exc:
-                ss.sync_error = str(exc)
-
 
     R = ss.R
     if R:
@@ -282,22 +252,49 @@ with tab_lib:
                      'Times used': t, 'Created': cr})
     if data: st.dataframe(pd.DataFrame(data), width='stretch', hide_index=True)
     else: st.info('The library is empty — patterns will appear after the first calculation.')
-    try:
-        saved = recent_results(DB)
-        if saved:
-            st.subheader('Saved result archive (central database)')
-            selected = st.selectbox('Open a stored result', [''] + [x[0] for x in saved],
-                                    format_func=lambda rid: next((f'{x[1]} — {x[2]}' for x in saved if x[0] == rid), 'Select a result'))
-            if selected:
-                remote = get_result(DB, selected)
-                if remote:
-                    c_pdf,c_xlsx=st.columns(2)
-                    c_pdf.download_button('Download stored PDF', base64.b64decode(remote['pdf']),
-                                          'layout.pdf','application/pdf',key='remote_pdf')
-                    c_xlsx.download_button('Download stored Excel',base64.b64decode(remote['xlsx']),
-                                           'layout.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',key='remote_xlsx')
-    except Exception as exc:
-        st.warning('Could not load saved result archive: ' + str(exc))
     jobs = lib.db.execute('SELECT created,name FROM jobs ORDER BY id DESC LIMIT 20').fetchall()
     if jobs:
         st.subheader('Calculation history'); st.dataframe(pd.DataFrame(jobs, columns=['Date', 'File']), hide_index=True)
+
+
+# ------------------------------------------------------------ cloud and browser storage
+# Intentionally placed AFTER all original UI sections to avoid disturbing
+# the layout visualization, cutting instructions, size finder, and library.
+with tab_lib:
+    st.divider()
+    with st.expander('Saved reports and browser backup', expanded=False):
+        if ss.get('sync_error'):
+            st.warning('Cloud save failed; report will be kept in this browser if IndexedDB is available.')
+        if st.button('Retry cloud save', disabled=not bool(ss.get('snapshot')) or not bool(ss.get('sync_error'))):
+            try:
+                save_result(DB, ss.snapshot)
+                ss.sync_error=None
+                st.rerun()
+            except Exception as exc:
+                st.error(f'Cloud save failed: {type(exc).__name__}')
+        try:
+            records = recent_results(DB)
+            if records:
+                selection = st.selectbox('Saved results', ['']+[r[0] for r in records],
+                   format_func=lambda rid: next((f'{r[1]} — {r[2]}' for r in records if r[0] == rid), 'Choose a report'))
+                if selection:
+                    remote=get_result(DB, selection)
+                    if remote:
+                        a,b=st.columns(2)
+                        a.download_button('Download stored PDF', base64.b64decode(remote['pdf']), 'layout.pdf','application/pdf')
+                        b.download_button('Download stored Excel', base64.b64decode(remote['xlsx']),'layout.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        except Exception:
+            st.warning('Cloud archive unavailable. Existing cutting tools remain unaffected.')
+        vault = components.declare_component('cutplanner_browser_vault', path=str(Path(__file__).with_name('browser_vault')))
+        event = vault(result=ss.snapshot, synced=not bool(ss.get('sync_error')), ack=ss.get('sync_ack'),
+                      key='cutplanner_browser_archive', default=None)
+        if isinstance(event,dict) and event.get('pending'):
+            candidate=event['pending']
+            if isinstance(candidate,dict) and candidate.get('id') != ss.get('sync_ack'):
+                try:
+                    save_result(DB,candidate)
+                    ss.sync_ack=candidate['id']
+                    ss.sync_error=None
+                    st.rerun()
+                except Exception:
+                    pass
