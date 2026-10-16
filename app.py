@@ -122,7 +122,49 @@ with st.sidebar:
     lib_only = st.checkbox('Use only patterns from the library')
     time_limit = st.number_input('Solver time limit, sec', 10, 600, 60, 10)
 
-tab_calc, tab_size, tab_lib = st.tabs(['Calculation', 'Size finder', 'Pattern library'])
+# Manual tab highlight is cleared the first time the user opens it.
+# Use Streamlit's tracked tab state so other tabs and their contents stay intact.
+def _on_cutplanner_tab_change():
+    if st.session_state.get('cutplanner_active_tab') == '📕 Manual':
+        st.query_params['manual_read'] = '1'
+
+_manual_read = st.query_params.get('manual_read') == '1'
+if not _manual_read:
+    st.markdown("""<style>
+    /* Highlight ONLY the Manual tab before it has been visited. */
+    button[data-baseweb="tab"]:last-child {
+      color: #b42318 !important;
+      background-color: rgba(220, 38, 38, 0.09) !important;
+      border-radius: 7px 7px 0 0;
+      font-weight: 750 !important;
+    }
+    button[data-baseweb="tab"]:last-child::before { content: "READ FIRST · "; }
+    button[data-baseweb="tab"]:last-child:hover {
+      background-color: rgba(220, 38, 38, 0.16) !important;
+    }
+    </style>""", unsafe_allow_html=True)
+
+tab_calc, tab_size, tab_lib, tab_manual = st.tabs(
+    ['Calculation', 'Size finder', 'Pattern library', '📕 Manual'],
+    key='cutplanner_active_tab', on_change=_on_cutplanner_tab_change,
+)
+
+# The acknowledgement lives in the existing signed-session URL, so F5 keeps
+# it without external cookies. Starting a new session shows the reminder again.
+@st.dialog('📕 PLEASE READ MANUAL FIRST')
+def _manual_reminder():
+    st.write('Before your first calculation, please read the **Manual** tab. It explains the order table, units, cutting settings and how to interpret the cutting diagrams.')
+    st.info('You can skip this reminder. The manual will always be available in the red tab.')
+    if st.button('OK, got it · Continue', type='primary', use_container_width=True, key='ack_manual_dialog'):
+        st.query_params['manual_seen'] = '1'
+        st.rerun()
+    if st.button('Skip for now', use_container_width=True, key='skip_manual_dialog'):
+        st.query_params['manual_seen'] = '1'
+        st.rerun()
+
+if st.query_params.get('manual_seen') != '1':
+    _manual_reminder()
+
 
 # ------------------------------------------------------------ calculation
 with tab_calc:
@@ -298,3 +340,69 @@ with tab_lib:
                     st.rerun()
                 except Exception:
                     pass
+
+# ------------------------------------------------------------ user manual
+# Deliberately appended: no changes to Calculation, Size finder, Pattern library,
+# visualizations, cloud storage or the optimization algorithm.
+with tab_manual:
+    st.subheader('📕 Cutplanner — Quick start manual')
+    st.warning('PLEASE READ BEFORE YOUR FIRST CALCULATION')
+    st.markdown("""
+    **1. Set up the paper and machine**
+
+    In the left sidebar, enter **Sheet width** and **Sheet length** in **millimetres**.
+    Set the **maximum guillotine cut length**, **edge trim**, and the number of
+    **sheets per pack**. The pack size matters: the planner calculates the
+    number of albums in multiples of this quantity.
+
+    **2. Enter your order (Calculation tab)**
+
+    Choose the unit for album sizes: **mm**, **cm**, or **inches**.
+    Add rows to the table using **Width**, **Length**, and **Albums** (quantity).
+    Alternatively, upload an Excel or CSV order file. Confirm the selected unit
+    before calculating: **switching units does not convert existing numbers**.
+
+    **3. Calculate the layout**
+
+    Click **Calculate layout**. The optimizer runs on the server and uses the
+    order, paper size, cutting parameters and saved patterns when applicable.
+    An internet connection is required for new calculations.
+
+    **4. Read the result**
+
+    Check **Sheets of paper**, **Packs**, **Patterns** and **Average waste**.
+    The summary tables show the quantity produced per format and any **surplus**.
+    A **⚠ waste warning** means a pattern exceeds your chosen waste threshold;
+    it is not necessarily a calculation failure.
+
+    **5. Inspect the cutting diagrams**
+
+    Scroll to **3. Cutting patterns** on the Calculation tab and **expand each
+    Pattern**. The left side shows the layout drawing; the right side shows the
+    **Cutting order**. Check these instructions before starting the guillotine.
+    Download the **PDF with patterns** or **Excel summary** if needed.
+
+    **6. Optional: use leftovers**
+
+    In the sidebar, **Fill sheet leftovers with formats** allows you to select
+    standard formats (A3–A6), or enter a custom format in millimetres, such as
+    `sample=100x150`. Leftovers are **not filled by default**. Check the by-products
+    information in the result to see what extra pieces were included.
+
+    **7. Other tabs**
+
+    - **Size finder:** enter sheet dimensions, your preferred album dimensions and
+      allowed size deviation. Click **Find size** to compare alternatives with
+      potentially lower waste. This is a separate tool, not a new cutting order.
+    - **Pattern library:** lists reusable saved patterns and recent calculation
+      history. The expandable **Saved reports and browser backup** section provides
+      saved PDF/Excel reports when cloud storage is configured.
+
+    **Saving and connectivity**
+
+    Successful calculations can be saved to Supabase when configured. Browser
+    storage can preserve completed reports, but **new calculations cannot run
+    offline**. Check the cloud-save warning before relying on a report being
+    available to colleagues on another device.
+    """)
+    st.info('Tip: Keep this manual open during your first job. Always verify the cutting diagram and knife-length constraint before cutting real paper.')
