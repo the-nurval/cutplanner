@@ -104,7 +104,16 @@ class Library:
             times_used INT DEFAULT 0, created TEXT)''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS jobs(
             id INTEGER PRIMARY KEY, name TEXT, created TEXT, result TEXT)''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS solutions(
+            key TEXT PRIMARY KEY, result TEXT, created TEXT)''')
         self.db.commit()
+    def get_solution(self, key):
+        rows = list(self.db.execute('SELECT result FROM solutions WHERE key=?', (key,)))
+        return json.loads(rows[0][0]) if rows else None
+    def put_solution(self, key, sol):
+        self.db.execute('DELETE FROM solutions WHERE key=?', (key,))
+        self.db.execute('INSERT INTO solutions(key,result,created) VALUES(?,?,?)',
+                        (key, json.dumps(sol), time.strftime('%Y-%m-%d %H:%M')))
     def load(self, sw, sl, pieces):
         out = {}
         for key, data in self.db.execute('SELECT key,data FROM patterns WHERE sw=? AND sl=?', (sw, sl)):
@@ -182,29 +191,143 @@ class Planner:
     def area(self, strips):
         return sum(self.counts(strips)[i] * a * b for i, (a, b) in enumerate(self.pieces.values()))
 
-def generate(pl, D, pool, log):
-    """Column generation (Gilmore-Gomory): adds new patterns to the pool."""
-    for n in pl.names:
-        d = np.zeros(len(pl.names)); d[pl.idx[n]] = 1
-        _, s = pl.best_pattern(d); pool.setdefault(pkey(s), s)
-    for it in range(300):
+def _column_generation(pl, D, pool, iters=300):
+    """Gilmore-Gomory LP for demand D; new patterns are added to the pool. Returns (A, LP result)."""
+    for it in range(iters):
         keys = list(pool); A = np.array([pl.counts(pool[k]) for k in keys]).T
         r = linprog(np.ones(len(keys)), A_ub=-A, b_ub=-D, bounds=(0, None), method='highs')
         v, s = pl.best_pattern(-r.ineqlin.marginals)
         if v <= 1 + 1e-7 or pkey(s) in pool: break
         pool[pkey(s)] = s
-    log(f'  theoretical minimum (LP): {r.fun:.1f} packs, patterns in pool: {len(pool)}')
+    return A, r
 
-def solve(pl, D, pool, new_keys, maxp, pen, newpen, tl):
-    keys = list(pool); A = np.array([pl.counts(pool[k]) for k in keys]).T
+def _packs_milp(A, D, maxp, tl, lp=None, cost=None, max_total=None, extra=()):
+    """Whole packs: fewest packs (or `cost`) with at most `maxp` patterns.
+    lp = theoretical minimum: the solver stops as soon as it reaches ceil(lp) instead of
+    spending the whole time limit proving that nothing better exists."""
     m, n = A.shape; ub = int(math.ceil(D.max())) + 1
-    c = np.r_[np.ones(n), pen + newpen * np.array([k in new_keys for k in keys], float)]
     cons = [LinearConstraint(np.hstack([A, np.zeros((m, n))]), D, np.inf),
             LinearConstraint(np.hstack([np.eye(n), -ub * np.eye(n)]), -np.inf, 0),
             LinearConstraint(np.r_[np.zeros(n), np.ones(n)][None, :], 0, maxp)]
+    if max_total is not None:
+        cons.append(LinearConstraint(np.r_[np.ones(n), np.zeros(n)][None, :], 0, max_total))
+    for row, lo in extra:                            # extra: row·x >= lo (only on pack variables)
+        cons.append(LinearConstraint(np.r_[row, np.zeros(n)][None, :], lo, np.inf))
+    c = cost if cost is not None else np.r_[np.ones(n), np.zeros(n)]
+    opts = {'time_limit': max(tl, 0.5)}
+    if lp is not None and cost is None:
+        t = math.ceil(lp - 1e-6)
+        if t > 0: opts['mip_rel_gap'] = max((t - lp) / t, 0) + 1e-6
     r = milp(c, constraints=cons, integrality=np.ones(2 * n),
-             bounds=Bounds(0, np.r_[np.full(n, ub), np.ones(n)]), options={'time_limit': tl})
-    if r.x is None: fail('No solution found (increase --max-patterns or remove --library-only).')
+             bounds=Bounds(0, np.r_[np.full(n, ub), np.ones(n)]), options=opts)
+    return r, (int(round(r.x[:n].sum())) if r.x is not None else None)
+
+def _usable(pl, pool, keep):
+    """Patterns allowed by the waste threshold (all patterns if the threshold leaves some size uncovered)."""
+    ok = [k for k in pool if keep(pool[k])]
+    if ok and all(any(pl.counts(pool[k])[i] > 0 for k in ok) for i in range(len(pl.names))): return ok
+    return list(pool)
+
+def _dive_once(pl, D, pool, rng, d):
+    """Residual rounding ("diving"): fix whole packs of one LP pattern, subtract what it produces,
+    re-run column generation for the remaining demand, repeat. Finds patterns that a good
+    WHOLE-pack solution needs but the plain LP never produces. Returns the total packs of the dive."""
+    resid = D.copy(); total = 0
+    while resid.max() > 0:
+        A, r = _column_generation(pl, np.clip(resid, 0, None), pool); x = r.x
+        if d == 0: i = int(np.argmax(x))
+        else:
+            w = np.maximum(x, 0) ** 2 + 1e-9; i = int(rng.choice(len(x), p=w / w.sum()))
+        f = x[i]
+        n = int(math.ceil(f)) if d % 2 and f - math.floor(f) >= 0.5 else int(math.floor(f + 1e-6))
+        n = max(1, n)
+        resid = resid - n * A[:, i]; total += n
+    return total
+
+def _from_bigger(pl, D, pool, delta):
+    """Plans the same order with every size `delta` mm bigger, then puts the real (smaller) pieces
+    into those patterns. A pattern for bigger pieces always fits the real ones, and the different
+    sizes lead the search to different combinations."""
+    try: big = Planner(pl.sw, pl.sl, {n: (a + delta, b + delta) for n, (a, b) in pl.pieces.items()})
+    except PlanError: return 0
+    bpool = {}
+    for n in big.names:
+        d = np.zeros(len(big.names)); d[big.idx[n]] = 1
+        _, s = big.best_pattern(d); bpool.setdefault(pkey(s), s)
+    _column_generation(big, D, bpool, iters=40)
+    added = 0
+    for s in bpool.values():
+        out = []
+        for h, cols in s:
+            nc = []
+            for n, w, ph, k in cols:
+                a, b = pl.pieces[n]
+                nc.append((n, a, b, k) if (w, ph) == (a + delta, b + delta) else (n, b, a, k))
+            out.append((max(k * ph for _, _, ph, k in nc), nc))
+        try: pl.validate(out)
+        except AssertionError: continue
+        k = pkey(out)
+        if k not in pool: pool[k] = canon(out); added += 1
+    return added
+
+def generate(pl, D, pool, log, maxp=8, keep=lambda s: True, budget=15):
+    """Pattern search in stages; stops as soon as a whole-pack solution reaches the theoretical minimum.
+    Returns (minimum possible packs, best packs found)."""
+    t0 = time.time()
+    for n in pl.names:
+        d = np.zeros(len(pl.names)); d[pl.idx[n]] = 1
+        _, s = pl.best_pattern(d); pool.setdefault(pkey(s), s)
+    _, r = _column_generation(pl, D, pool); lp = r.fun; target = math.ceil(lp - 1e-6)
+    log(f'  theoretical minimum: {lp:.1f} packs, so no fewer than {target}; patterns in pool: {len(pool)}')
+    def check(stage):
+        keys = _usable(pl, pool, keep); A = np.array([pl.counts(pool[k]) for k in keys]).T
+        _, packs = _packs_milp(A, D, maxp, 3, lp)
+        log(f'  {stage}: {packs} packs ({time.time() - t0:.0f} s)'); return packs
+    best = check('library + basic search')
+    if best == target: return target, best
+    rng = np.random.default_rng(0); d = 0; deltas = [3, 6]
+    while time.time() - t0 < budget:
+        if deltas and d >= 2 * (3 - len(deltas)):     # alternate: 2 dives, +3 mm, 2 dives, +6 mm, more dives
+            delta = deltas.pop(0); _from_bigger(pl, D, pool, delta); stage = f'patterns from sizes +{delta} mm'
+        else:
+            tot = _dive_once(pl, D, pool, rng, d); d += 1; stage = f'extra search, round {d}'
+            if tot != target and d % 2: continue
+        p = check(stage)
+        if p is not None: best = min(best, p) if best else p
+        if best == target: break
+    if best != target:
+        log(f'  best found: {best} packs; {target} might be possible but was not found within {budget} s')
+    return target, best
+
+def cut_count(strips):
+    """Knife cuts for one pass through a pack: strip cuts + column cuts + piece cuts (simplicity of cutting)."""
+    return sum(1 + sum(1 + max(k - 1, 0) for *_, k in cols) for _, cols in strips)
+
+def solve(pl, D, pool, new_keys, maxp, pen, newpen, tl, log=print, lp=None, quick=None):
+    """Priorities: 1) the order is complete; 2) fewest packs; 3) with those packs - least waste
+    (extra pieces of order sizes count as useful, so a needed pack is filled with them);
+    4) simplest cutting - fewer patterns, then fewer cuts, then library patterns."""
+    keys = list(pool); A = np.array([pl.counts(pool[k]) for k in keys]).T
+    n = A.shape[1]
+    if lp is None:                                   # minimum for these patterns
+        lp = linprog(np.ones(n), A_ub=-A, b_ub=-D, bounds=(0, None), method='highs').fun
+    # Step 1: fewest packs; stops as soon as the minimum is reached.
+    r1, best = _packs_milp(A, D, maxp, tl if quick is None else min(tl, quick), lp)
+    if r1.x is None: fail('No solution found (increase --max-patterns or remove --library-only).')
+    if r1.status == 1 and best > math.ceil(lp - 1e-6):
+        log('  warning: solver time limit reached, the result may not be the best one (increase the time limit)')
+    # Step 2: same packs, least waste = most useful area (in sheets).
+    area = np.array([pl.area(pool[k]) for k in keys]) / (pl.sw * pl.sl)
+    r2, p2 = _packs_milp(A, D, maxp, min(4, tl), cost=np.r_[-area, np.zeros(n)], max_total=best,
+                         extra=[(np.ones(n), best)])
+    if r2.x is None: r2 = r1
+    used = float(area @ np.round(r2.x[:n]))
+    # Step 3: same packs, same waste (within 0.05 sheet) - simplest cutting.
+    cuts = np.array([cut_count(pool[k]) for k in keys], float)
+    c = np.r_[0.001 * cuts, 1 + 0.1 * newpen * np.array([k in new_keys for k in keys], float)]
+    r3, p3 = _packs_milp(A, D, maxp, min(4, tl), cost=c, max_total=best,
+                         extra=[(np.ones(n), best), (area, used - 0.05)])
+    r = r3 if r3.x is not None else r2
     x = np.round(r.x[:n]).astype(int)
     return [(keys[i], int(x[i])) for i in range(n) if x[i] > 0]
 
@@ -439,16 +562,27 @@ def compute(orders, a, log=print, jobname=''):
     log(f'Sheet {W}×{Lg} mm, trim {a.trim} mm, pack {a.pack} sheets')
     lib = Library(a.db); pool = dict(lib.load(sw, sl, pieces)); libkeys = set(pool)
     log(f'Library patterns matching the order: {len(pool)}')
-    if not a.library_only:
-        log('Searching for new patterns...'); generate(pl, D, pool, log)
-    elif not pool: fail('The library has no patterns for this sheet / these sizes.')
     mw = getattr(a, 'max_waste', 100)
-    if mw < 100:
-        ok = {k: v for k, v in pool.items() if 100 - 100 * pl.area(v) / (W * Lg) <= mw}
-        cover = [any(pl.counts(v)[i] > 0 for v in ok.values()) for i in range(len(names))]
-        if all(cover): pool = ok; log(f'  patterns kept with waste ≤ {mw}%: {len(pool)}')
-        else: log(f'  warning: no patterns with waste ≤ {mw}% exist for some sizes; limit not applied')
-    sol = solve(pl, D, pool, set(pool) - libkeys, a.max_patterns, a.pattern_penalty, a.new_penalty, a.time_limit)
+    keep = lambda v: 100 - 100 * pl.area(v) / (W * Lg) <= mw
+    # The same order (sheet, sizes, quantities, settings) was solved before: reuse it, no new search.
+    skey = json.dumps([sw, sl, sorted(pieces.items()), [orders[n] for n in names], a.max_patterns, mw, a.library_only])
+    cached = lib.get_solution(skey)
+    if cached and all(k in pool for k, _ in cached):
+        log('Same order was calculated before: solution taken from the library')
+        sol = [(k, int(p)) for k, p in cached]
+    else:
+        if not a.library_only:
+            log('Searching for new patterns...')
+            budget = getattr(a, 'search_budget', 15)
+            generate(pl, D, pool, log, a.max_patterns, keep, budget)
+        elif not pool: fail('The library has no patterns for this sheet / these sizes.')
+        if mw < 100:
+            ok = {k: v for k, v in pool.items() if keep(v)}
+            cover = [any(pl.counts(v)[i] > 0 for v in ok.values()) for i in range(len(names))]
+            if all(cover): pool = ok; log(f'  patterns kept with waste ≤ {mw}%: {len(pool)}')
+            else: log(f'  warning: no patterns with waste ≤ {mw}% exist for some sizes; limit not applied')
+        sol = solve(pl, D, pool, set(pool) - libkeys, a.max_patterns, a.pattern_penalty, a.new_penalty, a.time_limit, log, quick=None if a.library_only else 5)
+        lib.put_solution(skey, sol)
     sol.sort(key=lambda t: -t[1]); result = []
     for i, (k, packs) in enumerate(sol):
         s = pool[k]; pl.validate(s)
@@ -466,9 +600,7 @@ def compute(orders, a, log=print, jobname=''):
     byprod = {}
     for r in result:
         for n, k in r['fill_counts'].items(): byprod[n] = byprod.get(n, 0) + k * r['sheets']
-    for k, s in pool.items():
-        if k not in libkeys: lib.save(k, s, sw, sl, pl.area(s), False)
-    for r in result: lib.save(r['key'], r['strips'], sw, sl, 0, True)
+    for r in result: lib.save(r['key'], r['strips'], sw, sl, pl.area(r['strips']), True)
     lib.db.execute('INSERT INTO jobs(name,created,result) VALUES(?,?,?)', (jobname, time.strftime('%Y-%m-%d %H:%M'),
                    json.dumps([[r['label'], r['packs']] for r in result]))); lib.commit()
     tot = sum(r['sheets'] for r in result)
