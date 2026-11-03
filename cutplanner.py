@@ -22,7 +22,7 @@ INCH = 25.4
 class PlanError(Exception): pass
 def fail(msg): raise PlanError(msg)
 UNITS = {'mm': 1.0, 'cm': 10.0, 'in': INCH}
-def to_mm(v, unit='in'): return int(math.ceil(v * UNITS[unit] - 1e-9))
+def to_mm(v, unit='in'): return int(math.round(v * UNITS[unit] - 1e-9))
 def fnum(v): return ('%g' % v)
 def cm(v): return '%.1f' % (v / 10)
 
