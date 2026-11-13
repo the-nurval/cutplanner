@@ -149,23 +149,6 @@ tab_calc, tab_size, tab_lib, tab_manual = st.tabs(
     key='cutplanner_active_tab', on_change=_on_cutplanner_tab_change,
 )
 
-# The acknowledgement lives in the existing signed-session URL, so F5 keeps
-# it without external cookies. Starting a new session shows the reminder again.
-@st.dialog('📕 PLEASE READ MANUAL FIRST')
-def _manual_reminder():
-    st.write('Before your first calculation, please read the **Manual** tab. It explains the order table, units, cutting settings and how to interpret the cutting diagrams.')
-    st.info('You can skip this reminder. The manual will always be available in the red tab.')
-    if st.button('OK, got it · Continue', type='primary', use_container_width=True, key='ack_manual_dialog'):
-        st.query_params['manual_seen'] = '1'
-        st.rerun()
-    if st.button('Skip for now', use_container_width=True, key='skip_manual_dialog'):
-        st.query_params['manual_seen'] = '1'
-        st.rerun()
-
-if st.query_params.get('manual_seen') != '1':
-    _manual_reminder()
-
-
 # ------------------------------------------------------------ calculation
 with tab_calc:
     st.subheader('1. Order')
@@ -406,3 +389,26 @@ with tab_manual:
     available to colleagues on another device.
     """)
     st.info('Tip: Keep this manual open during your first job. Always verify the cutting diagram and knife-length constraint before cutting real paper.')
+
+
+# ------------------------------------------------------------ manual reminder
+# Rendered LAST on purpose: while the main script run is still in progress
+# (slow DB/network calls), a click inside the dialog is lost and the user has
+# to click again. At the end of the run the page is idle, so the first click works.
+# The reminder is marked as seen as soon as it is shown, so closing it with X
+# (which does not notify the server) does not make it pop up again on the
+# next interaction. The flag lives in the signed-session URL, so F5 keeps it;
+# opening the app from a clean URL shows it again.
+@st.dialog('📕 PLEASE READ MANUAL FIRST')
+def _manual_reminder():
+    st.write('Before your first calculation, please read the **Manual** tab. It explains the order table, units, cutting settings and how to interpret the cutting diagrams.')
+    st.info('You can skip this reminder. The manual will always be available in the red tab.')
+    if st.button('OK, got it · Continue', type='primary', use_container_width=True, key='ack_manual_dialog'):
+        st.rerun()
+    if st.button('Skip for now', use_container_width=True, key='skip_manual_dialog'):
+        st.rerun()
+
+if st.query_params.get('manual_seen') != '1' and not ss.get('manual_reminder_shown'):
+    ss.manual_reminder_shown = True
+    st.query_params['manual_seen'] = '1'
+    _manual_reminder()
